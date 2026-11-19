@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#080d1b">
+    <title>MATRIX CIPHER LAB</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+    <script defer src="app.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+    <div class="ambient-layer" aria-hidden="true"></div>
+    <header class="shell topbar">
+        <a class="brand" href="#" id="brand-home" aria-label="Volver al inicio">
+            <span class="brand-mark">M×</span>
+            <span class="brand-name">MATRIX CIPHER LAB</span>
+        </a>
+        <div class="header-actions">
+            <button class="quiet-button" id="home-button" type="button">⌂ Inicio</button>
+            <button class="quiet-button" id="switch-button" type="button" hidden>↔ Cambiar modo</button>
+        </div>
+    </header>
+
+    <main class="shell">
+        <section id="landing">
+            <div class="eyebrow">Laboratorio interactivo · Álgebra lineal</div>
+            <h1 class="gradient-text">MATRIX CIPHER LAB</h1>
+            <p class="lead">Transforming messages through linear algebra</p>
+            <p class="notice"><strong>Aviso educativo:</strong> Este cifrado lineal es una demostración didáctica; no protege información sensible.</p>
+
+            <div class="flow-card">
+                <div class="flow-title">Del mensaje a la transformación matricial</div>
+                <div class="flow" aria-label="Mensaje a números, matriz X y cifrado B igual a A por X">
+                    <div class="flow-node"><span>✉</span><b>Mensaje</b><small>Texto original</small></div>
+                    <div class="flow-arrow" aria-hidden="true">→</div>
+                    <div class="flow-node"><span>01</span><b>Números</b><small>A=1…Z=27 · espacio=0</small></div>
+                    <div class="flow-arrow" aria-hidden="true">→</div>
+                    <div class="flow-node"><span>▦</span><b>Matriz X</b><small>n × n</small></div>
+                    <div class="flow-arrow" aria-hidden="true">→</div>
+                    <div class="flow-node"><span>∑</span><b>Cifrado</b><small>B = A × X</small></div>
+                </div>
+            </div>
+
+            <div class="mode-grid">
+                <button class="mode-card" type="button" data-screen="encrypt">
+                    <span class="mode-icon" aria-hidden="true">🔒</span>
+                    <strong>Encriptar Mensaje</strong>
+                    <small>Elige una clave y transforma un mensaje en una matriz.</small>
+                </button>
+                <button class="mode-card decode" type="button" data-screen="decrypt">
+                    <span class="mode-icon" aria-hidden="true">🔓</span>
+                    <strong>Descifrar Mensaje</strong>
+                    <small>Recupera el texto desde un archivo o una matriz B.</small>
+                </button>
+            </div>
+            <p class="guide-link"><button type="button" class="text-button" data-screen="guide">📖 Guía rápida / Tabla del alfabeto</button></p>
+        </section>
+
+        <section id="encrypt-screen" hidden>
+            <div class="workspace-heading">
+                <div><div class="eyebrow">Modo de trabajo · 01</div><h2>Encriptar mensaje</h2><p>Tu mensaje se convierte en una matriz cuadrada y se transforma con la clave.</p></div>
+            </div>
+            <div class="workspace-grid">
+                <section class="panel">
+                    <div class="panel-heading"><span class="step-index">01</span><div><h3>Matriz clave A</h3><p>Debe ser invertible para poder recuperar el mensaje.</p></div></div>
+                    <label class="field-label" for="enc-dim">Dimensión de la clave</label>
+                    <select id="enc-dim" aria-label="Dimensión de la matriz clave para encriptar">
+                        <option value="3">3 × 3</option><option value="4">4 × 4</option><option value="5">5 × 5</option><option value="6">6 × 6</option>
+                    </select>
+                    <div id="enc-matrix-editor" class="matrix-editor" aria-label="Editor de matriz clave A"></div>
+                    <div id="enc-matrix-status" class="matrix-status" role="status" aria-live="polite"></div>
+                    <button class="button ghost full" id="enc-random" type="button">⟳ Generar clave aleatoria invertible</button>
+                </section>
+                <section class="panel">
+                    <div class="panel-heading"><span class="step-index">02</span><div><h3>Mensaje original</h3><p>Se admiten letras españolas y espacios.</p></div></div>
+                    <label class="field-label" for="enc-text">Escribe tu mensaje <small id="enc-limit-label">máximo 9 caracteres</small></label>
+                    <textarea id="enc-text" maxlength="9" placeholder="Ejemplo: HOLA MUNDO" spellcheck="false"></textarea>
+                    <div class="counter">
+                        <span id="enc-input-warning" aria-live="polite"></span>
+                        <span id="enc-counter">0 / 9 caracteres</span>
+                        <div id="enc-character-progress" class="counter-track" role="progressbar" aria-label="Capacidad del mensaje" aria-valuemin="0" aria-valuemax="9" aria-valuenow="0">
+                            <span id="enc-character-progress-fill"></span>
+                        </div>
+                    </div>
+                    <button class="button full" id="encrypt-button" type="button">🔒 Encriptar mensaje</button>
+                </section>
+            </div>
+            <section id="enc-results" class="panel result-panel" hidden aria-live="polite">
+                <div class="result-label">Matriz cifrada B</div>
+                <div id="enc-encoding-readout" class="encoding-readout" aria-live="polite" hidden></div>
+                <div id="enc-final-matrix" class="math-view"></div>
+                <a id="download-json" class="button secondary" href="#" download="mensaje_cifrado.json">↓ Descargar JSON cifrado</a>
+                <button class="button ghost process-toggle" id="enc-process-toggle" type="button" aria-expanded="false">🔍 Mostrar proceso paso a paso</button>
+                <div id="enc-process" class="process-grid" hidden></div>
+            </section>
+        </section>
+
+        <section id="decrypt-screen" hidden>
+            <div class="workspace-heading">
+                <div><div class="eyebrow">Modo de trabajo · 02</div><h2>Descifrar mensaje</h2><p>Usa la misma clave invertible que se utilizó al encriptar.</p></div>
+            </div>
+            <div class="workspace-grid">
+                <section class="panel">
+                    <div class="panel-heading"><span class="step-index">01</span><div><h3>Matriz clave A</h3><p>Introduce la clave original usada para cifrar.</p></div></div>
+                    <label class="field-label" for="dec-dim">Dimensión de la clave</label>
+                    <select id="dec-dim" aria-label="Dimensión de la matriz clave para descifrar">
+                        <option value="3">3 × 3</option><option value="4">4 × 4</option><option value="5">5 × 5</option><option value="6">6 × 6</option>
+                    </select>
+                    <div id="dec-matrix-editor" class="matrix-editor" aria-label="Editor de matriz clave A"></div>
+                    <div id="dec-matrix-status" class="matrix-status" role="status" aria-live="polite"></div>
+                    <div class="key-load-control">
+                        <button class="button secondary full" id="use-last-key" type="button" aria-describedby="last-key-help" disabled>
+                            ⚡ Usar última clave de encriptado
+                        </button>
+                        <small id="last-key-help" class="field-help">Se activará después de encriptar un mensaje.</small>
+                    </div>
+                </section>
+                <section class="panel">
+                    <div class="panel-heading"><span class="step-index">02</span><div><h3>Matriz cifrada B</h3><p>Carga el JSON exportado o escribe los valores de B.</p></div></div>
+                    <label class="field-label" for="dec-file">Archivo JSON cifrado</label>
+                    <input class="file-input" id="dec-file" type="file" accept=".json,application/json">
+                    <div id="dec-file-status" class="inline-status" role="status" aria-live="polite"></div>
+                    <div class="divider">o ingresa B manualmente</div>
+                    <div class="field-label">Valores de la matriz B</div>
+                    <div id="dec-cipher-editor" class="cipher-editor" aria-label="Editor de matriz cifrada B"></div>
+                    <div class="button-row"><button class="button full" id="decrypt-button" type="button">🔓 Descifrar mensaje</button></div>
+                </section>
+            </div>
+            <section id="dec-results" class="panel result-panel" hidden aria-live="polite">
+                <div class="result-label">Mensaje recuperado</div>
+                <div id="dec-final-text" class="result-text"></div>
+                <div id="dec-result-note" class="result-subtitle"></div>
+                <div class="button-row">
+                    <button class="button secondary" id="copy-result" type="button">⧉ Copiar resultado</button>
+                    <button class="button ghost process-toggle" id="dec-process-toggle" type="button" aria-expanded="false">🔍 Mostrar proceso paso a paso</button>
+                </div>
+                <div id="dec-copy-status" class="inline-status" role="status" aria-live="polite"></div>
+                <div id="dec-process" class="process-grid" hidden></div>
+            </section>
+        </section>
+
+        <section id="guide-screen" class="guide-content" hidden>
+            <div class="workspace-heading">
+                <div><div class="eyebrow">Referencia</div><h2>Guía rápida</h2><p>El alfabeto español y las ideas detrás de cada operación.</p></div>
+            </div>
+            <section class="panel">
+                <h3>Alfabeto: cada carácter tiene un valor</h3>
+                <p class="guide-paragraph">A cada letra le corresponde un entero del 1 al 27. La Ñ cuenta como una letra y el espacio en blanco vale exactamente 0. Los acentos se normalizan automáticamente.</p>
+                <div id="alphabet-grid" class="alphabet-grid"></div>
+                <h3>Una clave reversible</h3>
+                <p class="guide-paragraph">La matriz cuadrada A debe contener enteros y tener determinante distinto de cero. Así existe su inversa A⁻¹.</p>
+                <h3>Codificación y recuperación</h3>
+                <p class="guide-paragraph">El mensaje ocupa exactamente n² posiciones. Si es más corto, las posiciones restantes se completan con ceros. Se calcula B = A × X y, para recuperar el texto, X = A⁻¹ × B.</p>
+                <p class="notice"><strong>Nota:</strong> es un modelo educativo sin aritmética modular, no un método criptográfico seguro.</p>
+            </section>
+        </section>
+    </main>
+    <footer class="shell footer">MATRIX CIPHER LAB · Aprende álgebra lineal jugando con matrices</footer>
+    <div id="toast-region" class="toast-region" role="status" aria-live="polite" aria-atomic="false"></div>
+</body>
+</html>
