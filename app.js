@@ -6,11 +6,11 @@ window.MathJax = {
 };
 
 const ALPHABET = "ABCDEFGHIJKLMNÑOPQRSTUVWXYZ";
-const CHAR_TO_NUM = Object.fromEntries(Array.from(ALPHABET, (char, index) => [char, index + 1]));
 const NUM_TO_CHAR = Object.fromEntries(Array.from(ALPHABET, (char, index) => [index + 1, char]));
 const MAX_DIMENSION = 6;
 const LAST_KEY_STORAGE = "matrixCipherLab.lastKey.v1";
 const SCRAMBLE_CHARACTERS = "ABCDEFGHIJKLMNÑOPQRSTUVWXYZ#%*0123456789";
+let pyEngine = null;
 let uploadedCipher = null;
 let lastDecryptedText = "";
 let downloadUrl = null;
@@ -19,8 +19,34 @@ let copyResetTimer = null;
 let counterPulseTimer = null;
 let previousCharacterCount = 0;
 let encodingRun = 0;
+let lastMessageInputInfo = { accents: false, rejected: false, truncated: false };
 const rippleTimers = new WeakMap();
 const buttonAnimationTimers = new WeakMap();
+
+async function initPythonEngine() {
+    const pyodide = await loadPyodide();
+    const response = await fetch("./cipher_engine.py");
+    if (!response.ok) throw new Error(`No se pudo cargar cipher_engine.py (${response.status}).`);
+    const source = await response.text();
+    pyodide.runPython(source);
+    const determinant = pyodide.globals.get("py_determinant");
+    const randomMatrix = pyodide.globals.get("py_random_matrix");
+    const encrypt = pyodide.globals.get("py_encrypt");
+    const decrypt = pyodide.globals.get("py_decrypt");
+    pyEngine = {
+        determinant: (matrix) => BigInt(determinant(JSON.stringify(matrix))),
+        randomMatrix: (dimension) => JSON.parse(randomMatrix(dimension)),
+        encrypt: (key, text) => JSON.parse(encrypt(JSON.stringify(key), text)),
+        decrypt: (key, cipher, originalLength, lowercase) => JSON.parse(
+            decrypt(
+                JSON.stringify(key),
+                JSON.stringify(cipher),
+                originalLength ?? null,
+                lowercase ? JSON.stringify(lowercase) : ""
+            )
+        )
+    };
+}
 
 function byId(id) {
     return document.getElementById(id);
@@ -38,7 +64,15 @@ function showScreen(screen) {
     };
     const scrollToTop = () => window.scrollTo({ top: 0, behavior: "smooth" });
     if (document.startViewTransition && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-        document.startViewTransition(updateView).finished.then(scrollToTop);
+        const transition = document.startViewTransition(updateView);
+        const reportTransitionError = (error) => {
+            const cancelled = error.name === "AbortError" ||
+                (error.name === "InvalidStateError" && error.message.includes("Transition was aborted"));
+            if (!cancelled) console.error("No se pudo completar la transición de pantalla:", error);
+        };
+        transition.ready.catch(reportTransitionError);
+        transition.updateCallbackDone.catch(reportTransitionError);
+        transition.finished.then(scrollToTop).catch(reportTransitionError);
     } else {
         updateView();
         const activeScreen = byId(selected);
@@ -55,7 +89,9 @@ function getDimension(prefix) {
 }
 
 function setDimension(prefix, dimension) {
-    byId(`${prefix}-dim`).value = String(dimension);
+    const selector = byId(`${prefix}-dim`);
+    selector.value = String(dimension);
+    pulseDimensionSelector(selector);
     buildMatrixEditor(prefix);
 }
 
@@ -78,6 +114,13 @@ function animateButton(button, className, duration) {
     buttonAnimationTimers.set(button, setTimeout(() => button.classList.remove(className), duration));
 }
 
+function pulseDimensionSelector(selector) {
+    selector.classList.remove("dimension-pulse");
+    void selector.offsetWidth;
+    selector.classList.add("dimension-pulse");
+    setTimeout(() => selector.classList.remove("dimension-pulse"), 420);
+}
+
 function sweepMathView(element) {
     element.classList.remove("scan-sweep");
     void element.offsetWidth;
@@ -95,6 +138,7 @@ function fillMatrixEditor(prefix, matrix, confirm = false, pop = false) {
 }
 
 function buildMatrixEditor(prefix) {
+    if (!pyEngine) return;
     const dimension = getDimension(prefix);
     const editor = byId(`${prefix}-matrix-editor`);
     editor.replaceChildren();
@@ -136,61 +180,8 @@ function readMatrix(prefix) {
     return { valid: true, matrix: values };
 }
 
-// Bareiss mantiene el determinante exacto para matrices de enteros.
-function determinantInteger(matrix) {
-    const size = matrix.length;
-    if (size === 0 || matrix.some((row) => row.length !== size)) throw new Error("La matriz clave debe ser cuadrada.");
-    const work = matrix.map((row) => row.map((value) => BigInt(value)));
-    let sign = 1n;
-    let previousPivot = 1n;
-    for (let pivotIndex = 0; pivotIndex < size - 1; pivotIndex += 1) {
-        let pivotRow = pivotIndex;
-        while (pivotRow < size && work[pivotRow][pivotIndex] === 0n) pivotRow += 1;
-        if (pivotRow === size) return 0n;
-        if (pivotRow !== pivotIndex) {
-            [work[pivotIndex], work[pivotRow]] = [work[pivotRow], work[pivotIndex]];
-            sign = -sign;
-        }
-        const pivot = work[pivotIndex][pivotIndex];
-        for (let row = pivotIndex + 1; row < size; row += 1) {
-            for (let col = pivotIndex + 1; col < size; col += 1) {
-                const numerator = work[row][col] * pivot - work[row][pivotIndex] * work[pivotIndex][col];
-                work[row][col] = numerator / previousPivot;
-            }
-            work[row][pivotIndex] = 0n;
-        }
-        previousPivot = pivot;
-    }
-    return sign * work[size - 1][size - 1];
-}
-
-function inverseMatrix(matrix) {
-    const size = matrix.length;
-    const work = matrix.map((row, index) => [
-        ...row.map(Number),
-        ...Array.from({ length: size }, (_, col) => index === col ? 1 : 0)
-    ]);
-    for (let col = 0; col < size; col += 1) {
-        let pivotRow = col;
-        for (let row = col + 1; row < size; row += 1) {
-            if (Math.abs(work[row][col]) > Math.abs(work[pivotRow][col])) pivotRow = row;
-        }
-        if (work[pivotRow][col] === 0) throw new Error("No se pudo calcular la inversa de esta matriz.");
-        [work[col], work[pivotRow]] = [work[pivotRow], work[col]];
-        const pivot = work[col][col];
-        for (let index = 0; index < size * 2; index += 1) work[col][index] /= pivot;
-        for (let row = 0; row < size; row += 1) {
-            if (row === col) continue;
-            const factor = work[row][col];
-            for (let index = 0; index < size * 2; index += 1) {
-                work[row][index] -= factor * work[col][index];
-            }
-        }
-    }
-    return work.map((row) => row.slice(size));
-}
-
 function validateKeyMatrix(prefix) {
+    if (!pyEngine) return null;
     const editor = byId(`${prefix}-matrix-editor`);
     const status = byId(`${prefix}-matrix-status`);
     const result = readMatrix(prefix);
@@ -201,7 +192,7 @@ function validateKeyMatrix(prefix) {
         status.textContent = `✕ ${result.error}`;
         return null;
     }
-    const determinant = determinantInteger(result.matrix);
+    const determinant = pyEngine.determinant(result.matrix);
     if (determinant === 0n) {
         editor.classList.remove("valid");
         editor.classList.add("invalid");
@@ -217,19 +208,12 @@ function validateKeyMatrix(prefix) {
 }
 
 function randomInvertibleMatrix(prefix) {
-    animateButton(byId("enc-random"), "rolling", 760);
-    const dimension = getDimension(prefix);
-    const matrix = Array.from({ length: dimension }, (_, row) =>
-        Array.from({ length: dimension }, (_, col) => row === col ? 1 : 0));
-    for (let operation = 0; operation < dimension * 3; operation += 1) {
-        let target = Math.floor(Math.random() * dimension);
-        let source = Math.floor(Math.random() * dimension);
-        while (source === target) source = Math.floor(Math.random() * dimension);
-        const factor = Math.floor(Math.random() * 5) - 2 || 1;
-        for (let col = 0; col < dimension; col += 1) {
-            matrix[target][col] += factor * matrix[source][col];
-        }
+    if (!pyEngine) {
+        showToast("El motor matemático aún no está disponible.", "error");
+        return;
     }
+    animateButton(byId("enc-random"), "rolling", 760);
+    const matrix = pyEngine.randomMatrix(getDimension(prefix));
     fillMatrixEditor(prefix, matrix, false, true);
 }
 
@@ -280,26 +264,6 @@ function readCipherMatrix() {
     return { valid: true, matrix };
 }
 
-function multiplyMatrices(left, right) {
-    const rows = left.length;
-    const inner = right.length;
-    const cols = right[0].length;
-    if (left.some((row) => row.length !== inner)) throw new Error("Las dimensiones no permiten multiplicar estas matrices.");
-    const integerInputs = left.flat().every(Number.isSafeInteger) && right.flat().every(Number.isSafeInteger);
-    return Array.from({ length: rows }, (_, row) =>
-        Array.from({ length: cols }, (_, col) => {
-            let sum = 0;
-            for (let index = 0; index < inner; index += 1) {
-                const product = left[row][index] * right[index][col];
-                if (integerInputs && (!Number.isSafeInteger(product) || !Number.isSafeInteger(sum + product))) {
-                    throw new Error("El resultado excede la precisión segura. Usa valores de clave más pequeños.");
-                }
-                sum += product;
-            }
-            return sum;
-        }));
-}
-
 function formatDotProduct(left, right) {
     return left.map((value, index) => `(${value}) × (${right[index]})`).join(" + ");
 }
@@ -345,7 +309,10 @@ function updateMessageLimit() {
     const limit = getDimension("enc") ** 2;
     const textarea = byId("enc-text");
     textarea.maxLength = limit;
-    if (textarea.value.length > limit) textarea.value = textarea.value.slice(0, limit);
+    if (textarea.value.length > limit) {
+        textarea.value = textarea.value.slice(0, limit);
+        lastMessageInputInfo.truncated = true;
+    }
     byId("enc-limit-label").textContent = `máximo ${limit} caracteres`;
     updateMessageCounter(false);
 }
@@ -375,15 +342,6 @@ function updateMessageCounter(rejected) {
     byId("enc-input-warning").textContent = rejected ? "Se quitaron caracteres no admitidos." : "";
 }
 
-// X se llena por filas; el JSON conserva longitud y mayúsculas para restaurar espacios finales.
-function makeMessageMatrix(text, dimension) {
-    const values = Array.from(text, (character) => character === " " ? 0 : CHAR_TO_NUM[character.toUpperCase()]);
-    const padded = [...values, ...Array(dimension * dimension - values.length).fill(0)];
-    const matrix = Array.from({ length: dimension }, (_, row) =>
-        Array.from({ length: dimension }, (_, col) => padded[row * dimension + col]));
-    return { values, padded, matrix };
-}
-
 function flattenRowMajor(matrix) {
     return matrix.flat();
 }
@@ -393,9 +351,9 @@ async function animateEncoding(text, values, cipher) {
     const readout = byId("enc-encoding-readout");
     const source = byId("enc-text");
     const stages = [
-        `Texto recibido · ${text}`,
-        `Mapeo numérico · [${values.join(", ")}]`,
-        `Valores cifrados · [${flattenRowMajor(cipher).join(", ")}]`
+        `Entrada normalizada · ${text}`,
+        `Codificación numérica · [${values.join(", ")}]`,
+        `Producto matricial · [${flattenRowMajor(cipher).join(", ")}]`
     ];
     readout.hidden = false;
     source.classList.remove("encode-source-active");
@@ -416,6 +374,31 @@ async function animateEncoding(text, values, cipher) {
         await new Promise((resolve) => setTimeout(resolve, 370));
     }
     if (run === encodingRun) readout.classList.add("encoding-complete");
+}
+
+async function runProcessing(prefix, phases) {
+    const status = byId(`${prefix}-processing`);
+    const label = byId(`${prefix}-processing-label`);
+    const button = byId(prefix === "enc" ? "encrypt-button" : "decrypt-button");
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const duration = reducedMotion ? 700 : 900;
+
+    status.hidden = false;
+    status.setAttribute("aria-busy", "true");
+    button.disabled = true;
+    if (reducedMotion) {
+        label.textContent = phases[phases.length - 1];
+        await new Promise((resolve) => setTimeout(resolve, duration));
+    } else {
+        const phaseDuration = duration / phases.length;
+        for (const phase of phases) {
+            label.textContent = phase;
+            await new Promise((resolve) => setTimeout(resolve, phaseDuration));
+        }
+    }
+    status.hidden = true;
+    status.removeAttribute("aria-busy");
+    button.disabled = false;
 }
 
 function showProcess(processId, toggleId, cards) {
@@ -528,7 +511,20 @@ function createBadges(values, labels) {
     return container;
 }
 
+function createProcessChips(items) {
+    const container = document.createElement("div");
+    container.className = "process-note";
+    items.forEach(({ text, kind = "" }) => {
+        container.appendChild(createTextElement("span", `process-chip ${kind}`.trim(), text));
+    });
+    return container;
+}
+
 async function encryptMessage() {
+    if (!pyEngine) {
+        showToast("El motor matemático aún no está disponible.", "error");
+        return;
+    }
     animateButton(byId("encrypt-button"), "encrypt-action", 1250);
     const validKey = validateKeyMatrix("enc");
     if (!validKey) {
@@ -541,12 +537,18 @@ async function encryptMessage() {
         return;
     }
     const dimension = validKey.matrix.length;
-    const { values, padded, matrix: plainMatrix } = makeMessageMatrix(text, dimension);
+    byId("enc-results").hidden = true;
+    const processToggle = byId("enc-process-toggle");
+    processToggle.disabled = true;
+    processToggle.onclick = null;
+    let values;
+    let padded;
+    let plainMatrix;
     let cipherMatrix;
     try {
-        cipherMatrix = multiplyMatrices(validKey.matrix, plainMatrix);
+        ({ values, padded, plainMatrix, cipherMatrix } = pyEngine.encrypt(validKey.matrix, text));
     } catch (error) {
-        showToast(error.message, "error");
+        showToast(error.message || "No fue posible encriptar el mensaje.", "error");
         return;
     }
     rememberEncryptionKey(validKey.matrix);
@@ -560,6 +562,14 @@ async function encryptMessage() {
     if (downloadUrl) URL.revokeObjectURL(downloadUrl);
     downloadUrl = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
     byId("download-json").href = downloadUrl;
+
+    await runProcessing("enc", [
+        "Mapeando caracteres…",
+        "Construyendo la matriz X…",
+        "Verificando det(A) ≠ 0…",
+        "Multiplicando B = A · X…"
+    ]);
+
     byId("enc-results").hidden = false;
     byId("enc-results").classList.remove("result-arrive");
     void byId("enc-results").offsetWidth;
@@ -575,31 +585,78 @@ async function encryptMessage() {
     ]);
     sweepMathView(byId("enc-final-matrix"));
 
-    const labels = Array.from(text, (character) => character === " " ? "␣" : character);
-    const allLabels = [...labels, ...Array(dimension * dimension - labels.length).fill("relleno")];
-    const stepOne = createStep("Paso 1 — Conversión de texto a números",
-        createBadges(padded, allLabels.map((label, index) => index >= labels.length ? "0 (relleno)" : label)));
+    const normalizationBody = document.createElement("div");
+    normalizationBody.append(
+        createTextElement("p", "", `Entrada lista: “${text}” · ${text.length} de ${dimension ** 2} caracteres.`),
+        createProcessChips([
+            { text: lastMessageInputInfo.accents ? "Tildes normalizadas" : "Tildes: sin cambios" },
+            { text: lastMessageInputInfo.rejected ? "Símbolos filtrados" : "Filtro: solo letras y espacio" },
+            { text: "Mayúsculas conservadas en el resultado" },
+            { text: lastMessageInputInfo.truncated ? "Recortado al límite n²" : `Límite n² = ${dimension ** 2}`, kind: "good" }
+        ]),
+        createTextElement("p", "process-caption", "La Ñ se mantiene como letra propia; los acentos se eliminan y los caracteres no admitidos se descartan.")
+    );
+    const stepOne = createStep("01 · Normalización y filtro", normalizationBody);
+
+    const labels = Array.from(text, (character) => character === " " ? "Esp" : character);
+    const stepTwoBody = document.createElement("div");
+    stepTwoBody.append(
+        createTextElement("p", "", "Cada carácter admitido se convierte en su valor del alfabeto."),
+        createBadges(values, labels)
+    );
+    const stepTwo = createStep("02 · Traducción a números", stepTwoBody);
+
     const xMath = document.createElement("div");
     xMath.className = "math-view";
     xMath.innerHTML = `\\[X = ${matrixLatex(plainMatrix)}\\]`;
-    const stepTwoBody = document.createElement("div");
-    stepTwoBody.append(xMath, createTextElement("p", "", "Los caracteres se colocan por filas. Las posiciones vacías se completan con 0 hasta formar una matriz n × n."));
-    const stepTwo = createStep("Paso 2 — Construcción de la matriz X", stepTwoBody);
+    const stepThreeBody = document.createElement("div");
+    stepThreeBody.append(
+        createTextElement("p", "", `Se agregaron ${padded.length - values.length} ceros para completar ${dimension} × ${dimension} posiciones; el recorrido llena X por filas.`),
+        xMath,
+        createBadges(padded, padded.map((_, index) => index < values.length ? `X${Math.floor(index / dimension) + 1}${index % dimension + 1}` : "relleno 0"))
+    );
+    const stepThree = createStep("03 · Relleno y acomodo en X", stepThreeBody);
+
+    const keyMath = document.createElement("div");
+    keyMath.className = "math-view";
+    keyMath.innerHTML = `\\[A \\in \\mathbb{Z}^{${dimension} \\times ${dimension}}, \\qquad \\det(A) = ${validKey.determinant.toString()} \\ne 0\\]`;
+    const stepFourBody = document.createElement("div");
+    stepFourBody.append(
+        keyMath,
+        createProcessChips([
+            { text: `Clave ${dimension} × ${dimension}` },
+            { text: `det(A) = ${validKey.determinant.toString()}`, kind: "good" },
+            { text: "Invertible", kind: "good" }
+        ])
+    );
+    const stepFour = createStep("04 · Clave y verificación", stepFourBody);
+
     const multiplyMath = document.createElement("div");
     multiplyMath.className = "math-view";
     multiplyMath.innerHTML = `\\[B = A \\times X = ${matrixLatex(validKey.matrix)} \\times ${matrixLatex(plainMatrix)}\\]`;
     const firstCalc = formatDotProduct(validKey.matrix[0], plainMatrix.map((row) => row[0]));
-    const stepThreeBody = document.createElement("div");
-    stepThreeBody.append(
+    const stepFiveBody = document.createElement("div");
+    stepFiveBody.append(
         multiplyMath,
         createTextElement("p", "formula-note", `Cada celda de B es el producto punto de una fila de A y una columna de X. Por ejemplo: B₁₁ = ${firstCalc} = ${cipherMatrix[0][0]}.`)
     );
-    const stepThree = createStep("Paso 3 — Operación matricial", stepThreeBody);
+    const stepFive = createStep("05 · Multiplicación B = A · X", stepFiveBody);
+
     const resultBody = document.createElement("div");
     resultBody.className = "math-view";
     resultBody.innerHTML = `\\[B = ${matrixLatex(cipherMatrix)}\\]`;
-    const stepFour = createStep("Paso 4 — Resultado final", resultBody);
-    byId("enc-process-toggle").onclick = () => showProcess("enc-process", "enc-process-toggle", [stepOne, stepTwo, stepThree, stepFour]);
+    const downloadLink = document.createElement("a");
+    downloadLink.className = "process-download";
+    downloadLink.href = byId("download-json").href;
+    downloadLink.download = "mensaje_cifrado.json";
+    downloadLink.append(createTextElement("span", "", "↓"), document.createTextNode("Descargar matriz en JSON"));
+    const stepSixBody = document.createElement("div");
+    stepSixBody.append(resultBody, downloadLink);
+    const stepSix = createStep("06 · Matriz cifrada B", stepSixBody);
+    processToggle.onclick = () => showProcess("enc-process", "enc-process-toggle", [
+        stepOne, stepTwo, stepThree, stepFour, stepFive, stepSix
+    ]);
+    processToggle.disabled = false;
 }
 
 function validatePayload(payload) {
@@ -660,38 +717,11 @@ async function loadCipherFile(file) {
     }
 }
 
-function reconstructMessage(values, metadata) {
-    const text = [];
-    values.forEach((value, index) => {
-        if (value === 0) text.push(" ");
-        else {
-            const letter = NUM_TO_CHAR[value];
-            text.push(metadata && metadata[index] ? letter.toLowerCase() : letter);
-        }
-    });
-    return text.join("");
-}
-
-// Solo se corrigen residuos de coma flotante dentro de tolerancia; el resto se rechaza.
-function decodedNumbers(inverse, cipher) {
-    const floating = multiplyMatrices(inverse, cipher);
-    const rounded = [];
-    for (let row = 0; row < floating.length; row += 1) {
-        const roundedRow = [];
-        for (let col = 0; col < floating[row].length; col += 1) {
-            const value = floating[row][col];
-            const integer = Math.round(value);
-            if (!Number.isFinite(value) || Math.abs(value - integer) > 1e-7 || integer < 0 || integer > 27) {
-                throw new Error("La clave no coincide o la matriz cifrada está dañada: se obtuvo un valor no entero fuera del rango 0–27.");
-            }
-            roundedRow.push(integer);
-        }
-        rounded.push(roundedRow);
-    }
-    return rounded;
-}
-
 async function decryptMessage() {
+    if (!pyEngine) {
+        showToast("El motor matemático aún no está disponible.", "error");
+        return;
+    }
     animateButton(byId("decrypt-button"), "decrypt-action", 1250);
     const validKey = validateKeyMatrix("dec");
     if (!validKey) {
@@ -719,23 +749,27 @@ async function decryptMessage() {
         cipher = manual.matrix;
     }
 
+    byId("dec-results").hidden = true;
     let inverse;
     let recovered;
+    let values;
     try {
-        inverse = inverseMatrix(validKey.matrix);
-        recovered = decodedNumbers(inverse, cipher);
+        const result = pyEngine.decrypt(validKey.matrix, cipher, originalLength, lowercase);
+        ({ inverse, recovered, values } = result);
+        lastDecryptedText = result.text;
     } catch (error) {
         showToast(error.message || "No fue posible descifrar los datos con esta clave.", "error");
         return;
     }
-    const flat = flattenRowMajor(recovered);
-    let values;
-    if (Number.isInteger(originalLength)) values = flat.slice(0, originalLength);
-    else {
-        values = [...flat];
-        while (values.length && values[values.length - 1] === 0) values.pop();
-    }
-    lastDecryptedText = reconstructMessage(values, lowercase);
+    await runProcessing("dec", [
+        "Validando la clave A…",
+        "Calculando la inversa A⁻¹…",
+        "Comprobando dimensiones de B…",
+        "Multiplicando X = A⁻¹ · B…",
+        "Validando enteros entre 0 y 27…",
+        "Reconstruyendo el texto…"
+    ]);
+
     byId("dec-results").hidden = false;
     byId("dec-results").classList.remove("result-arrive");
     void byId("dec-results").offsetWidth;
@@ -747,15 +781,43 @@ async function decryptMessage() {
     byId("dec-process-toggle").setAttribute("aria-expanded", "false");
     byId("dec-copy-status").textContent = "";
 
-    const chars = values.map((value) => value === 0 ? "␣" : NUM_TO_CHAR[value]);
-    const stepOne = createStep("Paso 1 — Conversión de texto a números", createBadges(values, chars));
-    const xMath = document.createElement("div");
-    xMath.className = "math-view";
-    xMath.innerHTML = `\\[X = ${matrixLatex(recovered)}\\]`;
-    const stepTwo = createStep("Paso 2 — Matriz recuperada X", xMath);
+    const keyMath = document.createElement("div");
+    keyMath.className = "math-view";
+    keyMath.innerHTML = `\\[A \\in \\mathbb{Z}^{${dimension} \\times ${dimension}}, \\qquad \\det(A) = ${validKey.determinant.toString()} \\ne 0\\]`;
+    const stepOneBody = document.createElement("div");
+    stepOneBody.append(
+        keyMath,
+        createProcessChips([
+            { text: `${dimension} × ${dimension} · enteros` },
+            { text: `det(A) = ${validKey.determinant.toString()}`, kind: "good" },
+            { text: "Clave invertible", kind: "good" }
+        ])
+    );
+    const stepOne = createStep("01 · Validación de clave A", stepOneBody);
+
     const inverseMath = document.createElement("div");
     inverseMath.className = "math-view";
-    inverseMath.innerHTML = `\\[\\det(A) = ${validKey.determinant.toString()}, \\qquad A^{-1} = ${matrixLatex(inverse, true)}\\]`;
+    inverseMath.innerHTML = `\\[A^{-1} = ${matrixLatex(inverse, true)}\\]`;
+    const stepTwoBody = document.createElement("div");
+    stepTwoBody.append(
+        inverseMath,
+        createTextElement("p", "", "Gauss–Jordan transforma [A | I] en [I | A⁻¹] para construir la matriz que deshace la clave.")
+    );
+    const stepTwo = createStep("02 · Cálculo de la inversa", stepTwoBody);
+
+    const cipherMath = document.createElement("div");
+    cipherMath.className = "math-view";
+    cipherMath.innerHTML = `\\[B = ${matrixLatex(cipher)}\\]`;
+    const stepThreeBody = document.createElement("div");
+    stepThreeBody.append(
+        cipherMath,
+        createProcessChips([
+            { text: `${cipher.length} × ${cipher[0].length} · matriz B` },
+            { text: "Dimensiones compatibles", kind: "good" }
+        ])
+    );
+    const stepThree = createStep("03 · Recepción de matriz B", stepThreeBody);
+
     const operationMath = document.createElement("div");
     operationMath.className = "math-view";
     operationMath.innerHTML = `\\[X = A^{-1} \\times B = ${matrixLatex(inverse, true)} \\times ${matrixLatex(cipher)}\\]`;
@@ -763,16 +825,38 @@ async function decryptMessage() {
         inverse[0].map((value) => Number(value.toFixed(4))),
         cipher.map((row) => row[0])
     );
-    const stepThreeBody = document.createElement("div");
-    stepThreeBody.append(
-        inverseMath,
+    const stepFourBody = document.createElement("div");
+    stepFourBody.append(
         operationMath,
-        createTextElement("p", "formula-note", `La inversa deshace la transformación. La primera posición se calcula con la fila 1 de A⁻¹ por la columna 1 de B: X₁₁ = ${firstCalc} ≈ ${recovered[0][0]}.`)
+        createTextElement("p", "formula-note", `A⁻¹ deshace la transformación de A. La primera posición es el producto punto de la fila 1 de A⁻¹ por la columna 1 de B: X₁₁ = ${firstCalc} ≈ ${recovered[0][0]}.`)
     );
-    const stepThree = createStep("Paso 3 — Inversa y operación matricial", stepThreeBody);
-    const stepFour = createStep("Paso 4 — Traducción de vuelta a letras",
-        createTextElement("p", "result-text", lastDecryptedText || "(mensaje vacío)"));
-    byId("dec-process-toggle").onclick = () => showProcess("dec-process", "dec-process-toggle", [stepOne, stepTwo, stepThree, stepFour]);
+    const stepFour = createStep("04 · Multiplicación X = A⁻¹ · B", stepFourBody);
+
+    const flatCount = recovered.length * recovered[0].length;
+    const removedCount = flatCount - values.length;
+    const cleanupDescription = Number.isInteger(originalLength)
+        ? `Se aplicó la longitud original del JSON (${originalLength}); los ceros restantes son relleno.`
+        : "Sin metadatos JSON, se quitaron únicamente los ceros finales de relleno.";
+    const stepFiveBody = document.createElement("div");
+    stepFiveBody.append(
+        createTextElement("p", "", cleanupDescription),
+        createBadges(values, values.map((value) => value === 0 ? "Esp" : NUM_TO_CHAR[value])),
+        createProcessChips([
+            { text: `Enteros válidos · 0–27`, kind: "good" },
+            { text: `${removedCount} posiciones de relleno` }
+        ])
+    );
+    const stepFive = createStep("05 · Verificación y limpieza", stepFiveBody);
+
+    const processOutput = createTextElement("p", "decoded-process-output", lastDecryptedText || "(mensaje vacío)");
+    processOutput.id = "dec-process-output";
+    const stepSix = createStep("06 · Reconstrucción del texto", processOutput);
+    const processCards = [stepOne, stepTwo, stepThree, stepFour, stepFive, stepSix];
+    byId("dec-process-toggle").onclick = () => {
+        const opening = byId("dec-process").hidden;
+        showProcess("dec-process", "dec-process-toggle", processCards);
+        if (opening) scrambleReveal(processOutput, lastDecryptedText || "(mensaje vacío)");
+    };
     byId("dec-results").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -800,7 +884,7 @@ function isValidSavedKey(saved) {
     if (!Array.isArray(saved.matrix) || saved.matrix.length !== saved.dimension ||
         saved.matrix.some((row) => !Array.isArray(row) || row.length !== saved.dimension ||
             row.some((value) => !Number.isSafeInteger(value)))) return false;
-    return determinantInteger(saved.matrix) !== 0n;
+    return pyEngine.determinant(saved.matrix) !== 0n;
 }
 
 function updateLastKeyControl() {
@@ -891,16 +975,33 @@ byId("switch-button").addEventListener("click", () => {
 document.querySelectorAll("[data-screen]").forEach((button) => {
     button.addEventListener("click", () => showScreen(button.dataset.screen));
 });
+document.querySelectorAll(".mode-card").forEach((card) => {
+    card.addEventListener("pointermove", (event) => {
+        const bounds = card.getBoundingClientRect();
+        card.style.setProperty("--pointer-x", `${event.clientX - bounds.left}px`);
+        card.style.setProperty("--pointer-y", `${event.clientY - bounds.top}px`);
+    });
+});
 ["enc", "dec"].forEach((prefix) => {
-    byId(`${prefix}-dim`).addEventListener("change", () => buildMatrixEditor(prefix));
+    byId(`${prefix}-dim`).addEventListener("change", (event) => {
+        pulseDimensionSelector(event.currentTarget);
+        buildMatrixEditor(prefix);
+    });
 });
 byId("enc-random").addEventListener("click", () => randomInvertibleMatrix("enc"));
 byId("use-last-key").addEventListener("click", useLastEncryptionKey);
 byId("enc-text").addEventListener("input", (event) => {
+    const raw = event.target.value;
     const result = sanitizeMessage(event.target.value);
     const limit = getDimension("enc") ** 2;
+    const truncated = result.value.length > limit;
+    lastMessageInputInfo = {
+        accents: /[\u0300-\u036f]/.test(raw.normalize("NFD")),
+        rejected: result.rejected,
+        truncated
+    };
     event.target.value = result.value.slice(0, limit);
-    updateMessageCounter(result.rejected || result.value.length > limit);
+    updateMessageCounter(result.rejected || truncated);
 });
 byId("encrypt-button").addEventListener("click", encryptMessage);
 byId("decrypt-button").addEventListener("click", decryptMessage);
@@ -948,8 +1049,22 @@ window.addEventListener("load", () => {
     }
 });
 
-buildMatrixEditor("enc");
-buildMatrixEditor("dec");
-populateAlphabet();
-restoreEncryptionKey();
-showScreen("home");
+(async () => {
+    document.body.inert = true;
+    document.body.setAttribute("aria-busy", "true");
+    try {
+        await initPythonEngine();
+        buildMatrixEditor("enc");
+        buildMatrixEditor("dec");
+        populateAlphabet();
+        restoreEncryptionKey();
+        showScreen("home");
+        document.body.inert = false;
+        document.body.removeAttribute("aria-busy");
+    } catch (error) {
+        console.error("Error cargando motor Python:", error);
+        showToast("No se pudo iniciar el motor matemático de Python.", "error");
+        document.body.inert = false;
+        document.body.removeAttribute("aria-busy");
+    }
+})();
